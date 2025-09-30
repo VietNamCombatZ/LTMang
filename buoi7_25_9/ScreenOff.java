@@ -18,6 +18,7 @@ public class ScreenOff extends JFrame {
         new ScreenOff();
     }
     int off = 50;
+//    int off=0;
     public ScreenOff() {
         this.setTitle("Share Screen");
         this.setSize(500, 400);

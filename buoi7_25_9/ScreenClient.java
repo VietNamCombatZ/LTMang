@@ -1,60 +1,137 @@
 package buoi7_25_9;
 
-import java.awt.Graphics;
-import java.awt.Image;
-import java.awt.Rectangle;
-import java.awt.Robot;
-import java.awt.Toolkit;
+import javax.imageio.ImageIO;
+import javax.swing.*;
+import java.awt.*;
 import java.awt.image.BufferedImage;
-import java.io.BufferedInputStream;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import java.io.IOException;
 import java.net.Socket;
 
-import javax.imageio.ImageIO;
-import javax.swing.JFrame;
-
+/**
+ * Sửa lỗi Client UI:
+ * - Không đọc mạng trong paint.
+ * - Dùng JPanel + paintComponent để chỉ vẽ.
+ * - Nhận dữ liệu ở thread riêng, readFully để đọc đủ n byte.
+ * - Tạo DataInputStream 1 lần; chỉ repaint khi có frame mới.
+ * - Giữ tỉ lệ ảnh; không gọi repaint() bên trong paint.
+ */
 public class ScreenClient extends JFrame {
-    Socket soc;
+
+    private volatile BufferedImage latestFrame;   // khung hình hiện tại (thread-safe qua volatile)
+    private final VideoPanel panel = new VideoPanel();
+    private Socket socket;
+    private DataInputStream in;
+
+    // Đổi host/port nếu cần
+    private static final String HOST = "localhost";
+    private static final int PORT = 2345;
+
     public static void main(String[] args) {
-        new ScreenClient();
+        SwingUtilities.invokeLater(ScreenClient::new);
     }
-    int off = 50;
+
     public ScreenClient() {
-        this.setTitle("Share Screen");
-        this.setSize(500, 400);
-        this.setDefaultCloseOperation(3);
-        try {
-            soc = new Socket("localhost",2345);
-        } catch(Exception e) {
-            System.exit(1);
-        }
+        setTitle("Share Screen (Client)");
+        setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        setSize(900, 600);
+        setLocationRelativeTo(null);
+        setLayout(new BorderLayout());
+        add(panel, BorderLayout.CENTER);
+        setVisible(true);
 
-        this.setVisible(true);
+        // Kết nối & bắt đầu vòng nhận khung hình (ở thread riêng)
+        new Thread(this::receiveLoop, "screen-receiver").start();
+
+        // Đảm bảo đóng tài nguyên khi cửa sổ tắt
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosing(java.awt.event.WindowEvent e) {
+                safeClose();
+            }
+        });
     }
 
-    public void paint(Graphics g) {
+    private void receiveLoop() {
         try {
-            DataInputStream bis = new DataInputStream(soc.getInputStream());
-            int n = bis.readInt();
-            byte tmp[] = bis.readNBytes(n);
+            socket = new Socket(HOST, PORT);
+            in = new DataInputStream(socket.getInputStream());
 
+            while (!socket.isClosed()) {
+                // 1) Đọc độ dài khung
+                int n;
+                try {
+                    n = in.readInt();
+                } catch (IOException ex) {
+                    break; // socket đóng/ lỗi: thoát vòng lặp
+                }
+                if (n <= 0 || n > (50 * 1024 * 1024)) { // chặn khung bất thường
+                    throw new IOException("Invalid frame size: " + n);
+                }
 
-            ByteArrayInputStream bis1 = new ByteArrayInputStream(tmp);
-            BufferedImage img1 = ImageIO.read(bis1);
-            int w = this.getWidth()-2*off;
-            int h = this.getHeight()-2*off;
-            Image img2 = img1.getScaledInstance(w,h, Image.SCALE_SMOOTH);
+                // 2) Đọc đủ n byte (readFully đảm bảo đủ)
+                byte[] buf = new byte[n];
+                in.readFully(buf);
 
-            g.drawImage(img2, off, off, this.getWidth()-off, this.getHeight()-off,
-                    0, 0, w,h, null);
-
-            this.repaint();
+                // 3) Giải mã ảnh (PNG từ server hiện tại)
+                BufferedImage img = ImageIO.read(new java.io.ByteArrayInputStream(buf));
+                if (img != null) {
+                    latestFrame = img;   // cập nhật frame mới
+                    panel.repaint();     // chỉ yêu cầu vẽ khi có frame mới
+                }
+            }
         } catch (Exception e) {
+            // Thông báo gọn khi mất kết nối
+            SwingUtilities.invokeLater(() ->
+                    JOptionPane.showMessageDialog(this, "Mất kết nối server: " + e.getMessage(), "Lỗi", JOptionPane.ERROR_MESSAGE)
+            );
+        } finally {
+            safeClose();
         }
     }
 
-}
+    private void safeClose() {
+        try { if (in != null) in.close(); } catch (IOException ignored) {}
+        try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
+    }
 
+    /** Panel chỉ phụ trách VẼ từ latestFrame (không làm I/O). */
+    private class VideoPanel extends JPanel {
+        private static final int MARGIN = 20;
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            BufferedImage img = latestFrame;
+            if (img == null) {
+                // vẽ placeholder nhẹ
+                Graphics2D g2 = (Graphics2D) g;
+                g2.setFont(getFont().deriveFont(Font.PLAIN, 14f));
+                String msg = "Đang chờ khung hình từ server...";
+                FontMetrics fm = g2.getFontMetrics();
+                int x = (getWidth() - fm.stringWidth(msg)) / 2;
+                int y = (getHeight() - fm.getHeight()) / 2 + fm.getAscent();
+                g2.drawString(msg, x, y);
+                return;
+            }
+
+            int availW = Math.max(1, getWidth() - 2 * MARGIN);
+            int availH = Math.max(1, getHeight() - 2 * MARGIN);
+
+            // Giữ tỉ lệ
+            double sx = availW / (double) img.getWidth();
+            double sy = availH / (double) img.getHeight();
+            double s = Math.min(sx, sy);
+
+            int drawW = (int) Math.round(img.getWidth() * s);
+            int drawH = (int) Math.round(img.getHeight() * s);
+            int x = (getWidth() - drawW) / 2;
+            int y = (getHeight() - drawH) / 2;
+
+            Graphics2D g2 = (Graphics2D) g.create();
+            // Ưu tiên tốc độ khi cần (có thể bật QUALITY nếu bạn muốn đẹp hơn)
+            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g2.drawImage(img, x, y, drawW, drawH, null);
+            g2.dispose();
+        }
+    }
+}

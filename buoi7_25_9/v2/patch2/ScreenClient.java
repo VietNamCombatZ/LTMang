@@ -19,7 +19,7 @@ public class ScreenClient extends JFrame {
     private volatile BufferedImage canvas = null;
     private final AtomicInteger framesThisSecond = new AtomicInteger(0);
     private volatile int fps = 0;
-    private float currentQuality = 0.7f;
+    private float currentQuality = 0.7f; //current quality
 
     private final JPanel screenPanel = new JPanel() {
         @Override
@@ -39,7 +39,7 @@ public class ScreenClient extends JFrame {
                 g2.setColor(Color.BLACK);
                 g2.fillRect(0, 0, getWidth(), getHeight());
                 g2.setColor(Color.WHITE);
-                g2.drawString("đang kết nối…", 20, 20);
+                g2.drawString("connecting to server...", 20, 20);
             }
 
             // HUD
@@ -64,9 +64,9 @@ public class ScreenClient extends JFrame {
 
         new Thread(() -> receiveLoop(host, port), "receiver").start();
 
-        // Repaint đều để UI mượt
+        // repaint for smoother UI
         new Timer(40, e -> screenPanel.repaint()).start();
-        // Cập nhật FPS mỗi giây
+        // update FPS and show every second
         new Timer(1000, e -> { fps = framesThisSecond.getAndSet(0); }).start();
     }
 
@@ -75,9 +75,9 @@ public class ScreenClient extends JFrame {
              DataInputStream in = new DataInputStream(socket.getInputStream());
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
 
-            int srcW = in.readInt();
-            int srcH = in.readInt();
-            System.out.println("[Client] Kích thước nguồn: " + srcW + "x" + srcH);
+//            int srcW = in.readInt();
+//            int srcH = in.readInt();
+//            System.out.println("[Client] Kích thước nguồn: " + srcW + "x" + srcH);
 
             long lastQualityCheck = System.currentTimeMillis();
 
@@ -85,7 +85,7 @@ public class ScreenClient extends JFrame {
                 long t0 = System.currentTimeMillis();
 
                 boolean isFull = in.readBoolean();
-                int seq = in.readInt();
+                int seq = in.readInt(); // số thứ tự khung hình
                 int w = in.readInt();
                 int h = in.readInt();
 
@@ -142,6 +142,7 @@ public class ScreenClient extends JFrame {
                 }
 
                 if (seq % 30 == 0) {
+//                    System.out.println("[Client] seq=" + seq + " latency=" + latency + "ms quality=" + (int)(currentQuality*100) + "%");
                     System.out.println("[Client] seq=" + seq + " latency=" + latency + "ms quality=" + (int)(currentQuality*100) + "%");
                 }
             }

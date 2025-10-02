@@ -16,7 +16,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class ScreenServer {
-    // ===== Tunables =====
+    //const parameters
     private static final int PORT = 2345;
     private static final int TARGET_FPS = 20;
     private static final int GOP = 10;               // 1 key + (GOP-1) delta
@@ -27,7 +27,7 @@ public class ScreenServer {
     private static final double SCALE_INIT = 1.0, SCALE_MIN = 0.50, SCALE_MAX = 1.0;
     private static final long BAD_MS = 60;           // encode+flush > 60ms coi là xấu
 
-    // ===== State =====
+    // state
     private final AtomicReference<ScreenFrame> latestFrame = new AtomicReference<>();
     private final List<ClientHandler> clients = Collections.synchronizedList(new ArrayList<>());
 
@@ -36,17 +36,17 @@ public class ScreenServer {
     }
 
     public void start() throws Exception {
-        System.out.println("[Server] Khởi động…");
+        System.out.println("[Server] Starting server");
         new Thread(new CaptureTask(), "capture").start();
 
         try (ServerSocket server = new ServerSocket(PORT)) {
-            System.out.println("[Server] Listen on " + PORT);
+            System.out.println("[Server] Listening on " + PORT);
             while (true) {
                 Socket clientSocket = server.accept();
                 ClientHandler handler = new ClientHandler(clientSocket);
                 clients.add(handler);
                 new Thread(handler, "sender-" + clientSocket.getRemoteSocketAddress()).start();
-                System.out.println("[Server] Kết nối mới, tổng: " + clients.size());
+                System.out.println("[Server] New connection, connection count: " + clients.size());
             }
         }
     }
@@ -60,7 +60,7 @@ public class ScreenServer {
         }
     }
 
-    // ===== Capture screen đều đặn =====
+    //Capture screen
     class CaptureTask implements Runnable {
         private int sequence = 0;
         public void run() {
@@ -71,7 +71,7 @@ public class ScreenServer {
                 while (true) {
                     long t0 = System.nanoTime();
                     BufferedImage screen = robot.createScreenCapture(screenRect);
-                    // Ép RGB (JPEG không cần alpha)
+                    // Ép RGB (JPEG no need alpha color)
                     if (screen.getType() != BufferedImage.TYPE_INT_RGB) {
                         BufferedImage rgb = new BufferedImage(screen.getWidth(), screen.getHeight(), BufferedImage.TYPE_INT_RGB);
                         Graphics g = rgb.getGraphics();
@@ -93,7 +93,8 @@ public class ScreenServer {
         }
     }
 
-    // ===== Gửi cho từng client: GOP + DELTA theo tiles + ABR =====
+
+    // Send data for client : GOP ((group of pictúe) + delta tile
     class ClientHandler implements Runnable {
         private final Socket socket;
         private float quality = Q_INIT;
@@ -115,26 +116,26 @@ public class ScreenServer {
                 ScreenFrame first;
                 while ((first = latestFrame.get()) == null) Thread.sleep(20);
 
-                // Gửi kích thước gốc để client log (không bắt buộc)
+                // raw frame size receive from server to client
                 out.writeInt(first.rawImage.getWidth());
                 out.writeInt(first.rawImage.getHeight());
                 out.flush();
 
-                // Gửi keyframe đầu tiên (đã scale)
+                // send first key frame
                 sendKey(out, first);
 
                 while (!socket.isClosed()) {
-                    // Nhận lệnh QUALITY từ client (tuỳ chọn)
-                    if (in.available() > 0) {
-                        String cmd = in.readUTF();
-                        if (cmd.startsWith("QUALITY:")) {
-                            try {
-                                float q = Float.parseFloat(cmd.substring(8));
-                                quality = clamp(q, Q_MIN, Q_MAX);
-                                System.out.println("[Client " + socket.getInetAddress() + "] chất lượng: " + (int) (quality * 100) + "%");
-                            } catch (Exception ignore) {}
-                        }
-                    }
+                    // receive quality report from client
+//                    if (in.available() > 0) {
+//                        String cmd = in.readUTF();
+//                        if (cmd.startsWith("QUALITY:")) {
+//                            try {
+//                                float q = Float.parseFloat(cmd.substring(8));
+//                                quality = clamp(q, Q_MIN, Q_MAX);
+//                                System.out.println("[Client " + socket.getInetAddress() + "] quality: " + (int) (quality * 100) + "%");
+//                            } catch (Exception ignore) {}
+//                        }
+//                    }
 
                     ScreenFrame cur = latestFrame.get();
                     if (cur == null || cur.sequence <= lastSentSeq) {
@@ -150,19 +151,21 @@ public class ScreenServer {
                         sendKey(out, cur);
                         framesSinceKey = 0;
                     } else {
-                        // so sánh trên ảnh đã scale để tile map khớp
+
+                        // compare with scaled image for tile map
                         BufferedImage scaled = resizeTo(cur.rawImage, scale);
                         List<Rect> tiles = diffTiles(lastSentImage, scaled, TILE_W, TILE_H, DIFF_THR);
 
                         int totalTiles = ((scaled.getWidth() + TILE_W - 1) / TILE_W)
                                 * ((scaled.getHeight() + TILE_H - 1) / TILE_H);
 
+                        //if tile changed > threshold --> send whole key frame
                         if ((float) tiles.size() / Math.max(1, totalTiles) > FULL_FRAME_THRESHOLD) {
-                            sendKey(out, cur); // thay đổi nhiều -> key rẻ hơn
+                            sendKey(out, cur);
                             framesSinceKey = 0;
                         } else {
                             sendDelta(out, cur.sequence, scaled.getWidth(), scaled.getHeight(), tiles, scaled);
-                            lastSentImage = scaled; // cập nhật reference theo các tile vừa áp dụng
+                            lastSentImage = scaled;
                             framesSinceKey++;
                         }
                     }
@@ -183,7 +186,7 @@ public class ScreenServer {
             BufferedImage scaled = resizeTo(frame.rawImage, scale);
             byte[] jpeg = encodeJpeg(scaled, quality);
 
-            // KEY frame: [boolean true][int seq][int w][int h][int len][bytes]
+
             out.writeBoolean(true);
             out.writeInt(frame.sequence);
             out.writeInt(scaled.getWidth());
@@ -197,8 +200,7 @@ public class ScreenServer {
         }
 
         private void sendDelta(DataOutputStream out, int seq, int w, int h, List<Rect> tiles, BufferedImage scaled) throws IOException {
-            // DELTA: [boolean false][int seq][int w][int h][int tileW][int tileH][int N]
-            //        N × { [int x][int y][int ww][int hh][int len][bytes] }
+
             out.writeBoolean(false);
             out.writeInt(seq);
             out.writeInt(w);
@@ -227,7 +229,8 @@ public class ScreenServer {
         }
 
         private void adaptABR(long sendMs) {
-            // mạng yếu -> giảm quality, rồi giảm scale
+
+            // bad network --> quality decrease, then scale decrease
             if (sendMs > BAD_MS) {
                 if (quality > Q_MIN + 1e-3) {
                     quality = (float) Math.max(Q_MIN, quality - 0.1f);
@@ -243,8 +246,8 @@ public class ScreenServer {
             }
         }
 
-        // ==== Utils ====
-        private float clamp(float v, float lo, float hi) { return Math.max(lo, Math.min(hi, v)); }
+
+//        private float clamp(float v, float lo, float hi) { return Math.max(lo, Math.min(hi, v)); }
 
         private BufferedImage resizeTo(BufferedImage src, double s) {
             if (s == 1.0) return src;
@@ -261,7 +264,8 @@ public class ScreenServer {
         private List<Rect> diffTiles(BufferedImage a, BufferedImage b, int tw, int th, int thr) {
             ArrayList<Rect> res = new ArrayList<>();
             if (a == null || a.getWidth() != b.getWidth() || a.getHeight() != b.getHeight()) {
-                // nếu chưa có reference đúng kích thước -> coi như mọi tile đều đổi
+
+                // if no reference image or different size -> all tiles changed
                 for (int y = 0; y < b.getHeight(); y += th) {
                     for (int x = 0; x < b.getWidth(); x += tw) {
                         int ww = Math.min(tw, b.getWidth() - x);
@@ -285,7 +289,7 @@ public class ScreenServer {
         }
 
         private boolean isBlockSame(BufferedImage oldImg, BufferedImage newImg, int x, int y, int w, int h, int thr) {
-            // So từng pixel; nếu thr>0, cho phép sai khác nhỏ (MAD)
+            // compare each pixel in block, allowing small difference if thr>0
             if (thr <= 0) {
                 for (int j = 0; j < h; j++) {
                     for (int i = 0; i < w; i++) {

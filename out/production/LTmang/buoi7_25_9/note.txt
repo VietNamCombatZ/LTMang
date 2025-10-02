@@ -1,0 +1,171 @@
+
+I/ V1
+1) Client UI (Swing) — đơ, giật, vẽ sai quy trình
+
+Vấn đề
+
+Đọc mạng và giải mã ảnh ngay trong JFrame.paint → blocking UI, dễ đơ khi mạng chậm.
+
+Gọi this.repaint() bên trong paint → vòng lặp repaint vô hạn, tốn CPU.
+
+Không gọi super.paint(g) → có thể gây nháy/không vẽ nền đúng.
+
+Tạo mới DataInputStream mỗi lần vẽ.
+
+Dùng Image.getScaledInstance (thường chậm, chất lượng/hiệu năng kém).
+
+Khắc phục
+
+Tách pipeline: thread nhận mạng (reader) → cập nhật BufferedImage dùng chung → panel.repaint() từ EDT.
+
+Dùng JPanel + override paintComponent(Graphics g) (gọi super.paintComponent).
+
+Tạo DataInputStream một lần khi mở socket; dùng readFully(byte[]) để đảm bảo đọc đủ n byte.
+
+Scale khi vẽ bằng Graphics2D.drawImage(img, x,y,w,h, null) + RenderingHints (hoặc để GPU làm nếu dùng JavaFX/OpenGL).
+
+Chỉ repaint khi có frame mới (từ thread nhận).
+
+2) Server – Capture/Encode — băng thông/CPU quá lớn
+
+Vấn đề
+
+Mã hoá PNG mỗi frame: nặng CPU, băng thông lớn → FPS thấp, nhiều client sẽ nghẽn.
+
+Không giới hạn FPS → chiếm CPU/GPU vô ích.
+
+Mỗi frame tạo ByteArrayOutputStream mới → GC churn.
+
+Không đóng/flush quản lý tài nguyên rõ ràng.
+
+Khắc phục
+
+Chuyển PNG → JPEG/WebP (lossy): giảm 5–10× dung lượng. (Chất lượng 0.6–0.8 là hợp lý cho desktop).
+
+Thêm giới hạn FPS (ví dụ 15–30 fps) và giảm FPS khi màn hình tĩnh.
+
+Tái sử dụng buffer (buffer pool) hoặc ít nhất tạo mới vừa đủ và để GC biết vòng đời ngắn; đóng ByteArrayOutputStream sau dùng.
+
+(Nâng cao) Dùng H.264 qua FFmpeg/JavaCV (tune zerolatency, GOP ngắn) → giảm băng thông mạnh, chất lượng ổn định.
+
+3) Server – Transport (gửi cho nhiều client) — tốn CPU, scale kém
+
+Vấn đề
+
+Mỗi client có 1 thread ScreenProcessing tạo DataOutputStream mới mỗi vòng → tốn CPU/GC.
+
+Không có backpressure: client chậm kéo tụt server; không có cơ chế drop frame cũ.
+
+TCP head-of-line blocking làm tăng trễ khi mất gói; không có thích ứng.
+
+Mỗi lần gửi lại clone() byte[]: tốn copy.
+
+Khắc phục
+
+Tạo DataOutputStream một lần trên mỗi kết nối; tái sử dụng.
+
+Thêm per-client ring buffer dung lượng nhỏ (4–8 khung); nếu đầy → drop oldest, luôn gửi khung mới nhất (giữ độ trễ thấp).
+
+Tách broadcaster: thread đọc 1 frame đã mã hoá → phân phối tham chiếu tới ring buffer mỗi client (tránh copy; có thể dùng ref-count).
+
+Dùng Java NIO/Netty (selector) thay vì 1 thread/client để scale hàng trăm kết nối.
+
+(Nâng cao) Dùng UDP/WebRTC cho realtime (NACK/PLI/jitter buffer) nếu cần độ trễ thấp & Internet.
+
+4) Đồng bộ & Tính đúng — race condition, rủi ro đọc dở
+
+Vấn đề
+
+Screen.tmp và Screen.count là biến tĩnh không đồng bộ; có thể đọc “khung dở”.
+
+Logic so sánh countNow == Screen.count không đảm bảo bộ nhớ nhìn thấy nhất quán giữa threads.
+
+Khắc phục
+
+Đánh dấu Screen.tmp và Screen.count là volatile hoặc dùng AtomicReference<byte[]> cho tmp.
+
+Luôn gán mảng mới (immutable) cho khung hiện tại; client không chỉnh sửa.
+
+Nếu vẫn muốn an toàn hơn: gói frame trong một object {byte[] data; int seq; long ts;} và dùng AtomicReference.
+
+5) Giao thức truyền — tối giản quá mức
+
+Vấn đề
+
+Chỉ có int length + payload. Không có codec id, kích thước gốc, timestamp, frame id, keyframe flag.
+
+Không có CRC/checksum để phát hiện lỗi dữ liệu (đặc biệt nếu sau này dùng UDP).
+
+Khắc phục
+
+Thiết kế header cố định (ví dụ 24–48 bytes): magic, version, codec, width, height, frame_id, timestamp, flags, payload_len.
+
+Với H.264: đánh dấu keyframe; client mới vào/đứt mạch → yêu cầu I-frame (server gửi ngay).
+
+(UDP) Thêm trường fragmentation: frag_idx/frag_total.
+
+6) Ổn định, xử lý lỗi & đóng tài nguyên
+
+Vấn đề
+
+“Nuốt” hết Exception (catch trống) → rất khó debug, dễ treo âm thầm.
+
+Không đóng socket/stream trong finally/try-with-resources.
+
+Không có cơ chế reconnect client, heartbeat.
+
+Khắc phục
+
+Ghi log (ít nhất printStackTrace() trong giai đoạn phát triển), phân loại lỗi (I/O, decode, timeout).
+
+Dùng try-with-resources cho socket/streams; hoặc đóng trong finally.
+
+Implement heartbeat (ping/pong) và reconnect với backoff (0.5 → 2 → 5s).
+
+Phát hiện client “chết” (I/O fail) → dọn tài nguyên ngay.
+
+7) Bảo mật
+
+Vấn đề
+
+Không mã hoá, không xác thực → lộ màn hình trên LAN/WAN nếu bị sniff/scan.
+
+Khắc phục
+
+Dùng TLS (SSLServerSocket/SSLEngine với NIO) khi đi qua mạng tin cậy thấp.
+
+Xác thực (token/khóa phiên) trước khi phát nội dung.
+
+Giới hạn IP, rate-limit kết nối mới.
+
+8) Tối ưu chất lượng/độ trễ
+
+Vấn đề
+
+Màn hình tĩnh vẫn gửi đủ FPS → lãng phí băng thông, CPU.
+
+Văn bản UI cần rõ nét, nhưng JPEG có thể mờ nếu nén mạnh.
+
+Khắc phục
+
+RoC/Tiles: chia màn hình thành ô (32–64 px), chỉ gửi ô thay đổi (nén LZ4/Zstd) → tiết kiệm cực lớn khi tĩnh.
+
+“Event-driven FPS”: khi không thay đổi → hạ FPS (2–5); khi có thay đổi → tăng lại (15–30).
+
+Nếu ưu tiên độ rõ chữ: dùng lossless cho ô nhỏ (LZ4), hoặc WebP lossless; còn lại dùng lossy.
+
+9) Khả năng mở rộng & đa nền tảng
+
+Vấn đề
+
+1 thread/client + PNG + copy nhiều → khó vượt quá vài chục client.
+
+Robot hoạt động nhưng không tối ưu bằng API native (DXGI/VideoToolbox).
+
+Khắc phục
+
+Netty/NIO + broadcaster + ring buffer → hàng trăm client LAN.
+
+Chuẩn video H.264 + hardware encoder (NVENC/QuickSync/VideoToolbox) → CPU thấp, mở rộng tốt.
+
+(Tuỳ nền tảng) Cân nhắc APIs native cho capture nếu cần hiệu năng cao.

@@ -7,6 +7,8 @@ import java.awt.image.BufferedImage;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.net.Socket;
+import java.util.ArrayDeque;
+import java.util.Deque;
 
 /**
  * Sửa lỗi Client UI:
@@ -22,6 +24,10 @@ public class ScreenClient extends JFrame {
     private final VideoPanel panel = new VideoPanel();
     private Socket socket;
     private DataInputStream in;
+    private volatile long latestFrameRecvNs = 0L; // thời điểm KHUNG MỚI được nhận xong (ns)
+
+
+
 
     // Đổi host/port nếu cần
     private static final String HOST = "localhost";
@@ -51,36 +57,32 @@ public class ScreenClient extends JFrame {
         });
     }
 
+    // ----- 1) Bộ đếm FPS cho receive -----
+    private final FpsMeter recvFps = new FpsMeter(1_000_000_000L);   // cửa sổ 1 giây
+    // ----- 2) Bộ đếm FPS cho render -----
+    private final FpsMeter renderFps = new FpsMeter(1_000_000_000L); // cửa sổ 1 giây
+
     private void receiveLoop() {
         try {
             socket = new Socket(HOST, PORT);
             in = new DataInputStream(socket.getInputStream());
 
             while (!socket.isClosed()) {
-                // 1) Đọc độ dài khung
-                int n;
-                try {
-                    n = in.readInt();
-                } catch (IOException ex) {
-                    break; // socket đóng/ lỗi: thoát vòng lặp
-                }
-                if (n <= 0 || n > (50 * 1024 * 1024)) { // chặn khung bất thường
-                    throw new IOException("Invalid frame size: " + n);
-                }
+                int n = in.readInt();
+                if (n <= 0 || n > (50 * 1024 * 1024)) throw new IOException("Invalid frame size: " + n);
 
-                // 2) Đọc đủ n byte (readFully đảm bảo đủ)
                 byte[] buf = new byte[n];
                 in.readFully(buf);
 
-                // 3) Giải mã ảnh (PNG từ server hiện tại)
                 BufferedImage img = ImageIO.read(new java.io.ByteArrayInputStream(buf));
                 if (img != null) {
-                    latestFrame = img;   // cập nhật frame mới
-                    panel.repaint();     // chỉ yêu cầu vẽ khi có frame mới
+                    latestFrame = img;
+                    latestFrameRecvNs = System.nanoTime(); // mốc thời gian nhận xong khung
+                    recvFps.onTick(latestFrameRecvNs);     // cập nhật receive FPS
+                    panel.repaint();
                 }
             }
         } catch (Exception e) {
-            // Thông báo gọn khi mất kết nối
             SwingUtilities.invokeLater(() ->
                     JOptionPane.showMessageDialog(this, "Mất kết nối server: " + e.getMessage(), "Lỗi", JOptionPane.ERROR_MESSAGE)
             );
@@ -94,44 +96,114 @@ public class ScreenClient extends JFrame {
         try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
     }
 
-    /** Panel chỉ phụ trách VẼ từ latestFrame (không làm I/O). */
     private class VideoPanel extends JPanel {
         private static final int MARGIN = 20;
+        private boolean showHud = true;
+
+        VideoPanel() {
+            // phím H bật/tắt HUD
+            setFocusable(true);
+            addKeyListener(new java.awt.event.KeyAdapter() {
+                @Override public void keyPressed(java.awt.event.KeyEvent e) {
+                    if (e.getKeyChar() == 'h' || e.getKeyChar() == 'H') {
+                        showHud = !showHud;
+                        repaint();
+                    }
+                }
+            });
+        }
 
         @Override
         protected void paintComponent(Graphics g) {
             super.paintComponent(g);
             BufferedImage img = latestFrame;
             if (img == null) {
-                // vẽ placeholder nhẹ
-                Graphics2D g2 = (Graphics2D) g;
-                g2.setFont(getFont().deriveFont(Font.PLAIN, 14f));
-                String msg = "Đang chờ khung hình từ server...";
-                FontMetrics fm = g2.getFontMetrics();
-                int x = (getWidth() - fm.stringWidth(msg)) / 2;
-                int y = (getHeight() - fm.getHeight()) / 2 + fm.getAscent();
-                g2.drawString(msg, x, y);
+                drawCentered((Graphics2D) g, "Đang chờ khung hình từ server... (nhấn H để ẩn/hiện HUD)");
                 return;
             }
 
+            // vẽ ảnh giữ tỉ lệ
             int availW = Math.max(1, getWidth() - 2 * MARGIN);
             int availH = Math.max(1, getHeight() - 2 * MARGIN);
-
-            // Giữ tỉ lệ
-            double sx = availW / (double) img.getWidth();
-            double sy = availH / (double) img.getHeight();
-            double s = Math.min(sx, sy);
-
+            double s = Math.min(availW / (double) img.getWidth(), availH / (double) img.getHeight());
             int drawW = (int) Math.round(img.getWidth() * s);
             int drawH = (int) Math.round(img.getHeight() * s);
             int x = (getWidth() - drawW) / 2;
             int y = (getHeight() - drawH) / 2;
 
             Graphics2D g2 = (Graphics2D) g.create();
-            // Ưu tiên tốc độ khi cần (có thể bật QUALITY nếu bạn muốn đẹp hơn)
             g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
             g2.drawImage(img, x, y, drawW, drawH, null);
+
+            // cập nhật render FPS sau khi vẽ
+            long now = System.nanoTime();
+            renderFps.onTick(now);
+
+            if (showHud) {
+                // Độ trễ "age" từ lúc nhận khung đến lúc vẽ (ms)
+                double ageMs = (now - latestFrameRecvNs) / 1_000_000.0;
+
+                String hud = String.format(
+                        "Recv FPS: %.1f | Render FPS: %.1f | Age: %.1f ms (nhấn H ẩn/hiện)",
+                        recvFps.getFps(), renderFps.getFps(), ageMs
+                );
+                drawHud(g2, hud);
+            }
+
             g2.dispose();
+        }
+
+        private void drawCentered(Graphics2D g2, String msg) {
+            g2.setFont(getFont().deriveFont(Font.PLAIN, 14f));
+            FontMetrics fm = g2.getFontMetrics();
+            int x = (getWidth() - fm.stringWidth(msg)) / 2;
+            int y = (getHeight() - fm.getHeight()) / 2 + fm.getAscent();
+            g2.drawString(msg, x, y);
+        }
+
+        private void drawHud(Graphics2D g2, String text) {
+            g2.setFont(getFont().deriveFont(Font.BOLD, 13f));
+            FontMetrics fm = g2.getFontMetrics();
+            int pad = 6;
+            int w = fm.stringWidth(text) + pad * 2;
+            int h = fm.getHeight() + pad * 2;
+            int x = 10, y = 10;
+
+            // nền mờ dễ đọc
+            Composite old = g2.getComposite();
+            g2.setComposite(AlphaComposite.SrcOver.derive(0.35f));
+            g2.setColor(Color.BLACK);
+            g2.fillRoundRect(x, y, w, h, 10, 10);
+            g2.setComposite(old);
+
+            g2.setColor(Color.WHITE);
+            g2.drawString(text, x + pad, y + pad + fm.getAscent());
+        }
+    }
+
+    // ----- Lớp đo FPS: đếm tick trong cửa sổ thời gian -----
+    private static class FpsMeter {
+        private final long windowNs;               // kích thước cửa sổ (ns)
+        private final Deque<Long> timestamps = new ArrayDeque<>();
+
+        FpsMeter(long windowNs) { this.windowNs = windowNs; }
+
+        synchronized void onTick(long nowNs) {
+            timestamps.addLast(nowNs);
+            // bỏ các tick cũ ra khỏi cửa sổ
+            long cutoff = nowNs - windowNs;
+            while (!timestamps.isEmpty() && timestamps.peekFirst() < cutoff) {
+                timestamps.removeFirst();
+            }
+        }
+
+        synchronized double getFps() {
+            if (timestamps.size() < 2) return 0.0;
+            long first = timestamps.peekFirst();
+            long last  = timestamps.peekLast();
+            double spanSec = (last - first) / 1_000_000_000.0;
+            if (spanSec <= 0) return 0.0;
+            return (timestamps.size() - 1) / spanSec;
         }
     }
 }

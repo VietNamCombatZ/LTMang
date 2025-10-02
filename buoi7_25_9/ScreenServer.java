@@ -185,36 +185,31 @@ public class ScreenServer {
      * - Enqueue vào ring buffer của từng session (drop oldest nếu đầy)
      * - Gọi selector.wakeup() để thread I/O đẩy đi ngay
      */
+    // === BÊN TRONG runBroadcaster(...) ===
     private void runBroadcaster(Selector selector, Map<SocketChannel, ClientSession> sessions) {
         int lastSeq = -1;
-
         while (true) {
             try {
                 Frame f = CURRENT_FRAME.get();
-                if (f == null || f.seq == lastSeq) {
-                    Thread.sleep(2);
-                    continue;
-                }
+                if (f == null || f.seq == lastSeq) { Thread.sleep(2); continue; }
                 lastSeq = f.seq;
 
-                // Chuẩn bị 2 buffer: header (length int) + payload (JPEG)
-                ByteBuffer header = ByteBuffer.allocate(4);
-                header.putInt(f.jpeg.length).flip();
-
-                // payload: wrap trên cùng byte[] (zero-copy data), mỗi client sẽ có duplicate riêng
-                ByteBuffer payload = ByteBuffer.wrap(f.jpeg);
-
-                // Phát cho tất cả session
+                // KHÔNG dùng 1 header/payload chung + duplicate nữa.
                 for (ClientSession sess : sessions.values()) {
-                    // Tạo duplicates riêng cho session (độc lập position/limit)
-                    ByteBuffer h = header.duplicate();
-                    ByteBuffer p = payload.duplicate();
+                    // 1) Header riêng cho client
+                    ByteBuffer header = ByteBuffer.allocate(4);
+                    header.putInt(f.jpeg.length);
+                    header.flip(); // pos=0, limit=4
 
-                    // enqueue; nếu đầy -> drop oldest (giữ độ trễ thấp)
-                    sess.enqueue(h, p);
+                    // 2) Payload: ByteBuffer riêng, read-only, pos=0
+                    ByteBuffer payload = ByteBuffer.wrap(f.jpeg).asReadOnlyBuffer();
+                    payload.rewind(); // đảm bảo pos=0
+
+                    // 3) Enqueue vào ring buffer client (drop oldest nếu đầy)
+                    sess.enqueue(header, payload);
                 }
 
-                // Đánh thức selector để push ngay
+                // Đánh thức thread I/O
                 selector.wakeup();
             } catch (InterruptedException ignored) {
             } catch (Exception e) {
@@ -241,12 +236,18 @@ public class ScreenServer {
         // Enqueue header+payload; nếu đầy -> drop oldest
         synchronized void enqueue(ByteBuffer header, ByteBuffer payload) {
             if (closed) return;
-            if (ring.size() >= capacity) {
-                ring.pollFirst(); // drop oldest
-            }
-            ring.offerLast(new ByteBuffer[]{header, payload});
-        }
 
+            // BẢO ĐẢM buffer đặt đúng pos/limit (phòng hờ caller quên)
+            if (header.position() != 0) header.rewind();
+            if (payload.position() != 0) payload.rewind();
+
+            if (ring.size() >= capacity) {
+                ring.pollFirst(); // drop oldest -> giữ độ trễ thấp
+            }
+
+            // Lưu ý: Ở đây MỖI CLIENT nhận CẶP BUFFER RIÊNG, không phải duplicate từ gốc dùng chung.
+            ring.offerLast(new ByteBuffer[]{ header, payload });
+        }
         synchronized ByteBuffer[] peek() {
             return ring.peekFirst();
         }
